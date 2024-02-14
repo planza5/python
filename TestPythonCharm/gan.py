@@ -1,9 +1,10 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models
+import numpy as np
+import wandb
+from wandb.keras import WandbCallback
+import matplotlib.pyplot as plt
 
-latent_dim = 100
-epochs = 500
-batch = 32
 
 def build_generator(latent_dim):
     model = tf.keras.Sequential()
@@ -54,28 +55,14 @@ def build_gan(generator, discriminator):
     discriminator.trainable = False
 
     # Modelo compuesto
-    gan_input = tf.keras.Input(shape=(latent_dim,))  # Define la dimensión del espacio latente
+    gan_input = tf.keras.Input(shape=(config.latent_dim,))  # Define la dimensión del espacio latente
     generated_image = generator(gan_input)  # Genera la imagen a partir del ruido
     gan_output = discriminator(generated_image)  # Discrimina la imagen generada
 
     # Crear el modelo GAN con el input del generador y el output del discriminador
     gan = models.Model(gan_input, gan_output)
 
-    # Compilar el modelo GAN
-    gan.compile(optimizer='adam', loss='binary_crossentropy')
-
     return gan
-
-import numpy as np
-
-def get_real_images(X_train, num_samples=16):
-    # Seleccionar índices de manera aleatoria
-    indices = np.random.randint(0, X_train.shape[0], num_samples)
-    # Seleccionar las imágenes
-    images = X_train[indices]
-    # Normalizar las imágenes al rango [-1, 1]
-    images_normalized = (images.astype('float32') / 127.5) - 1
-    return images_normalized
 
 
 def get_fake_images(generator, latent_dim, num_images=16):
@@ -88,33 +75,78 @@ def get_fake_images(generator, latent_dim, num_images=16):
     return generated_images
 
 
+wandb.init(project='MNIST Santander', entity='pplanza2')
+
+config = wandb.config
+config.learning_rate_dis = 0.0001
+config.learning_rate_gen = 0.001
+config.epochs=1000
+config.latent_dim = 100
+config.batch_size = 32
+
+
 # carga datos
 (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
 
+# Configuración del optimizador con la tasa de aprendizaje especificada
+adam_optimizer_dis = tf.keras.optimizers.Adam(learning_rate=config.learning_rate_dis)
+adam_optimizer_gen = tf.keras.optimizers.Adam(learning_rate=config.learning_rate_gen)
+
 # Crea el generador
-generator = build_generator(latent_dim)
+generator = build_generator(config.latent_dim)
 
 # Crea el disrciminador y compilamos
 discriminator = build_discriminator(image_shape=(28, 28, 1))
-discriminator.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+discriminator.compile(optimizer=adam_optimizer_dis, loss='binary_crossentropy', metrics=['accuracy'])
 
 gan = build_gan(generator,discriminator)
+gan.compile(optimizer=adam_optimizer_gen, loss='binary_crossentropy')
 
-for epoch in range(epochs):
-    real_images = get_real_images(x_train,16)
-    real_labels = np.ones((16, 1))
+# Suponiendo que `x_train` es tu conjunto de datos de imágenes.
+num_batches = int(np.ceil(x_train.shape[0] / float(config.batch_size)))
 
-    fake_images = get_fake_images(generator,latent_dim)
-    fake_labels = np.zeros((16, 1))
+for epoch in range(config.epochs):
+    for batch_num in range(num_batches):
+        #indices inicio y fin segun batch
+        start_idx = batch_num * config.batch_size
+        end_idx = min((batch_num + 1) * config.batch_size, x_train.shape[0])
 
-    # Entrenar el discriminador
-    d_loss_real = discriminator.train_on_batch(real_images, real_labels)
-    d_loss_fake = discriminator.train_on_batch(fake_images, fake_labels)
-    d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+        # Traemos lote de imagenes reales y etiquetas a 1
+        real_images = x_train[start_idx:end_idx]
+        real_images = (real_images.astype('float32') / 127.5) - 1
+        real_images = np.expand_dims(real_images, axis=-1)
+        real_labels = np.ones((config.batch_size, 1))
 
-    noise = np.random.normal(0, 1, (batch, latent_dim))
-    misleading_labels = np.ones((batch, 1))  # Etiquetas engañosas para el generador
+        # Traemos lote de imagenes falsas y etiquetas a 0
+        fake_images = get_fake_images(generator,config.latent_dim, config.batch_size)
+        fake_labels = np.zeros((config.batch_size, 1))
 
-    g_loss = gan.train_on_batch(noise, misleading_labels)
+        # Entrenar el discriminador
+        if batch_num == 0 or batch_num % 3 == 0:
+            print("Entrenando discriminador")
+            d_loss_real = discriminator.train_on_batch(real_images, real_labels)
+            d_loss_fake = discriminator.train_on_batch(fake_images, fake_labels)
 
-    print(f"Epoch: {epoch + 1}/{epochs}, D Loss: {d_loss[0]}, G Loss: {g_loss}")
+        # Promedio de las pérdidas
+        d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+
+        # Ruido y etiquetas falsas para engañar al discriminador
+        noise = np.random.normal(0, 1, (32, config.latent_dim))
+        misleading_labels = np.ones((32, 1))  # Etiquetas engañosas para el generador
+
+        # Entrenando generador
+        print("Entrenando generador")
+        g_loss = gan.train_on_batch(noise, misleading_labels)
+
+        wandb.log({'epoch': epoch, 'd_loss': d_loss[0], 'g_loss': g_loss, 'd_acc': d_loss[1]})
+        print(f"Epoch: {epoch + 1}/{config.epochs}, batch nº: {batch_num}, D Loss: {d_loss[0]}, G Loss: {g_loss}")
+
+        if epoch % 100 == 0:  # Ejemplo: Cada 10 épocas
+            # Generar imágenes de muestra
+            sample_images = get_fake_images(generator, config.latent_dim, num_images=config.batch_size)
+            # Escalar las imágenes del rango [-1, 1] al rango [0, 255]
+            sample_images = ((sample_images * 0.5) + 0.5) * 255.0
+            # Asegúrate de que las imágenes sean enteros, ya que los píxeles deben ser valores enteros
+            sample_images = np.clip(sample_images, 0, 255).astype(np.uint8)
+            wandb.log({"examples": [wandb.Image(img, caption=f"Epoch {epoch}") for img in sample_images]})
+            wandb.log({"reals": [wandb.Image(img, caption=f"Epoch {epoch}") for img in real_images]})
